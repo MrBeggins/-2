@@ -86,6 +86,35 @@
     .pct-positive { color: var(--accent); }
     .pct-negative { color: var(--negative); }
     .pct-null { color: var(--muted); }
+    .divergence-panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      margin-bottom: 1rem;
+    }
+    .divergence-panel h3 {
+      font-size: 0.9rem;
+      margin: 0 0 0.6rem;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .divergence-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    .divergence-table th { color: var(--muted); font-weight: normal; text-align: left; padding: 0.2rem 0.5rem; border-bottom: 1px solid var(--border); }
+    .divergence-table td { padding: 0.3rem 0.5rem; border-bottom: 1px solid #2a2d35; }
+    .divergence-table tr.alert td { background: rgba(255,82,82,0.08); }
+    .divergence-badge { background: var(--negative); color: #fff; border-radius: 10px; padding: 0.1rem 0.45rem; font-size: 0.75rem; margin-left: 0.4rem; }
+    .div-threshold {
+      font-size: 0.78rem; color: var(--muted); margin-left: auto;
+      display: flex; align-items: center; gap: 0.4rem;
+    }
+    .div-threshold input {
+      width: 52px; background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 0.15rem 0.35rem; font-size: 0.8rem; text-align: center;
+    }
     .settings-panel {
       background: var(--card);
       border: 1px solid var(--border);
@@ -195,6 +224,28 @@
     <span class="last-update" id="lastUpdate"></span>
   </div>
   <div id="message"></div>
+  <div id="divergencePanel" class="divergence-panel" style="display:none;">
+    <h3>
+      📊 Расхождение акция / фьючерс
+      <span id="divergenceAlertCount" class="divergence-badge" style="display:none;"></span>
+      <span class="div-threshold">
+        Порог:
+        <input type="number" id="divThreshold" value="0.3" min="0.1" max="5" step="0.1">%
+      </span>
+    </h3>
+    <table class="divergence-table">
+      <thead>
+        <tr>
+          <th>Акция</th>
+          <th>% акции</th>
+          <th>Фьючерс</th>
+          <th>% фьюча</th>
+          <th>Расхождение</th>
+        </tr>
+      </thead>
+      <tbody id="divergenceBody"></tbody>
+    </table>
+  </div>
   <div id="settingsPanel" class="settings-panel" style="display: none;">
     <h2>Выберите инструменты для отображения <small style="color:var(--muted);font-weight:normal;">(профиль: <span id="profileNameInSettings"></span>, лимит: <span id="limitInfo">0/40</span>)</small></h2>
     <div id="limitWarning" class="msg error" style="display:none;margin-bottom:0.75rem;"></div>
@@ -219,6 +270,15 @@
     <div style="margin-top: 0.75rem;">
       <button type="button" id="btnSaveSettings" onclick="var ids=[]; document.querySelectorAll('#settingsList input[type=checkbox]:checked').forEach(function(cb){ids.push(cb.value);}); localStorage.setItem('damir_futures_selected_ids',JSON.stringify(ids)); document.getElementById('settingsPanel').style.display='none'; if(typeof saveSettings==='function')saveSettings(); else location.reload();">Сохранить</button>
     </div>
+
+    <hr style="border-color:var(--border);margin:1rem 0;">
+    <h2 style="margin-bottom:0.5rem;">API ключи <small style="color:var(--muted);font-weight:normal;">T-Invest токены для запросов</small></h2>
+    <div id="apiKeysList" style="margin-bottom:0.6rem;"></div>
+    <div style="display:flex;gap:0.5rem;">
+      <input type="password" id="apiKeyInput" placeholder="Вставьте токен T-Invest..." style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:0.4rem 0.7rem;font-size:0.85rem;">
+      <button type="button" onclick="addApiKey()">Добавить</button>
+    </div>
+    <div style="margin-top:0.4rem;font-size:0.78rem;color:var(--muted);">Ключи хранятся только в вашем браузере. Если ключей нет — используется серверный токен.</div>
   </div>
   <div class="table-wrap">
     <table id="mainTable">
@@ -584,10 +644,255 @@
       document.body.classList.toggle('loading', loading);
     }
 
+    // ===== API ключи =====
+    const STORAGE_API_KEYS = 'widget_api_keys_' + CURRENT_PROFILE;
+
+    function getApiKeys() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_API_KEYS) || '[]'); } catch { return []; }
+    }
+    function saveApiKeys(keys) {
+      localStorage.setItem(STORAGE_API_KEYS, JSON.stringify(keys));
+    }
+    function renderApiKeys() {
+      const list = document.getElementById('apiKeysList');
+      if (!list) return;
+      const keys = getApiKeys();
+      list.innerHTML = '';
+      if (keys.length === 0) {
+        list.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;">Ключи не добавлены — используется серверный токен</div>';
+        return;
+      }
+      keys.forEach((k, i) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:0.5rem;align-items:center;margin-bottom:0.4rem;';
+        const masked = k.length > 8 ? k.slice(0, 4) + '••••••••' + k.slice(-4) : '••••••••';
+        row.innerHTML = `
+          <span style="font-family:monospace;font-size:0.85rem;flex:1;color:var(--text);">${masked}</span>
+          <button type="button" onclick="deleteApiKey(${i})" style="padding:0.2rem 0.6rem;font-size:0.8rem;background:var(--negative);border-color:var(--negative);color:#fff;">✕</button>
+        `;
+        list.appendChild(row);
+      });
+    }
+    function addApiKey() {
+      const inp = document.getElementById('apiKeyInput');
+      const val = inp.value.trim();
+      if (!val) return;
+      const keys = getApiKeys();
+      if (keys.includes(val)) { inp.value = ''; return; }
+      keys.push(val);
+      saveApiKeys(keys);
+      inp.value = '';
+      renderApiKeys();
+    }
+    function deleteApiKey(i) {
+      const keys = getApiKeys();
+      keys.splice(i, 1);
+      saveApiKeys(keys);
+      renderApiKeys();
+    }
+
     function fetchWithTimeout(url, ms) {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), ms);
-      return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
+      const keys = getApiKeys();
+      const headers = keys.length > 0 ? { 'X-API-Tokens': keys.join(',') } : {};
+      return fetch(url, { signal: ctrl.signal, headers }).finally(() => clearTimeout(t));
+    }
+
+    // ===== Polling браузерных уведомлений =====
+    function startNotifyPolling() {
+      // Запрашиваем разрешение сразу при загрузке
+      if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission();
+      }
+      setInterval(async () => {
+        try {
+          const r = await fetch('/api/notify/poll');
+          if (!r.ok) return;
+          const data = await r.json();
+          for (const n of (data.notifications || [])) {
+            showBrowserNotification(n.msg);
+          }
+        } catch (_) {}
+      }, 3000);
+    }
+
+    function showBrowserNotification(msg) {
+      if (!('Notification' in window)) return;
+      if (Notification.permission === 'granted') {
+        const n = new Notification('Виджет', { body: msg, silent: false });
+        setTimeout(() => n.close(), 5000);
+      }
+    }
+
+    // ===== Мониторинг расхождений акция/фьючерс =====
+
+    // Маппинг: тикер акции → массив возможных префиксов фьючерса
+    // Тикеры могут быть вида SBRF-6.26 — ищем по startsWith(префикс)
+    const SPOT_FUTURES_MAP = {
+      "SBER": ["SBRF", "SBERF"],
+      "GAZP": ["GAZRF", "GAZR"],
+      "LKOH": ["LKOH"],
+      "NVTK": ["NK", "NVTK"],
+      "GMKN": ["GM", "GMKN"],
+      "VTBR": ["VB", "VTBR"],
+      "PLZL": ["PZ", "PLZL"],
+      "ROSN": ["RN", "ROSN"],
+      "TATN": ["TT", "TATN"],
+      "YNDX": ["YN", "YNDX", "YDEX"],
+      "MGNT": ["MN", "MGNT"],
+      "AFLT": ["AF", "AFLT"],
+      "ALRS": ["AL", "ALRS"],
+      "MTSS": ["MT", "MTSS"],
+      "NLMK": ["NM", "NLMK"],
+      "MAGN": ["MG", "MAGN"],
+      "CHMF": ["CH", "CHMF"],
+      "POLY": ["PL", "POLY"],
+      "PHOR": ["PH", "PHOR"],
+      "IRAO": ["IR", "IRAO"],
+    };
+
+    let _notifiedPairs = {};   // {key: timestamp} — чтобы не спамить одним и тем же
+    let _divTimer = null;
+
+    function getDivThreshold() {
+      const el = document.getElementById('divThreshold');
+      return el ? (parseFloat(el.value) || 0.3) : 0.3;
+    }
+
+    // Найти фьючерс в currentRows по префиксу тикера
+    function findFuturesByPrefix(prefixes) {
+      if (!currentRows || !prefixes) return null;
+      for (const row of currentRows) {
+        const ticker = (row.ticker || row.instrument_id || '').toUpperCase();
+        for (const p of prefixes) {
+          if (ticker.startsWith(p.toUpperCase())) return row;
+        }
+      }
+      return null;
+    }
+
+    async function checkDivergence() {
+      try {
+        const r = await fetchWithTimeout('/api/spot_prices', 10000);
+        if (!r.ok) return;
+        const data = await r.json();
+        const stocks = data.stocks || [];
+
+        const threshold = getDivThreshold();
+        const alerts = [];
+        const rows = [];
+
+        for (const stock of stocks) {
+          if (stock.change_pct == null) continue;
+          const prefixes = SPOT_FUTURES_MAP[stock.ticker.toUpperCase()];
+          if (!prefixes) continue;
+          const futRow = findFuturesByPrefix(prefixes);
+          if (!futRow) continue;
+
+          const futPct = futRow.deviation_pct ?? futRow.change_pct ?? null;
+          if (futPct == null) continue;
+
+          const diff = Math.abs(stock.change_pct - futPct);
+          const isAlert = diff >= threshold;
+
+          rows.push({ stock, futRow, futPct, diff, isAlert });
+          if (isAlert) alerts.push({ stock, futRow, futPct, diff });
+        }
+
+        renderDivergenceTable(rows);
+
+        // Уведомления — не чаще раза в 2 минуты для каждой пары
+        const now = Date.now();
+        for (const a of alerts) {
+          const key = `${a.stock.ticker}_${(a.futRow.ticker || a.futRow.instrument_id || '').slice(0, 6)}`;
+          if (_notifiedPairs[key] && now - _notifiedPairs[key] < 120000) continue;
+          _notifiedPairs[key] = now;
+          sendDivNotification(a);
+        }
+
+      } catch (e) {
+        console.warn('divergence check failed', e);
+      }
+    }
+
+    function renderDivergenceTable(rows) {
+      const panel = document.getElementById('divergencePanel');
+      const tbody = document.getElementById('divergenceBody');
+      const badge = document.getElementById('divergenceAlertCount');
+      if (!panel || !tbody) return;
+
+      if (rows.length === 0) {
+        panel.style.display = 'none';
+        return;
+      }
+      panel.style.display = 'block';
+
+      const alertCount = rows.filter(r => r.isAlert).length;
+      if (alertCount > 0) {
+        badge.textContent = alertCount;
+        badge.style.display = 'inline';
+      } else {
+        badge.style.display = 'none';
+      }
+
+      tbody.innerHTML = rows.map(({ stock, futRow, futPct, diff, isAlert }) => {
+        const sSign = stock.change_pct >= 0 ? '+' : '';
+        const fSign = futPct >= 0 ? '+' : '';
+        const dSign = diff >= 0 ? '+' : '';
+        const sCls = stock.change_pct > 0 ? 'pct-positive' : stock.change_pct < 0 ? 'pct-negative' : 'pct-null';
+        const fCls = futPct > 0 ? 'pct-positive' : futPct < 0 ? 'pct-negative' : 'pct-null';
+        const dCls = isAlert ? 'pct-negative' : 'pct-null';
+        const futName = futRow.name || futRow.ticker || futRow.instrument_id || '—';
+        return `<tr class="${isAlert ? 'alert' : ''}">
+          <td>${stock.ticker}</td>
+          <td class="${sCls} num">${sSign}${stock.change_pct}%</td>
+          <td>${futName}</td>
+          <td class="${fCls} num">${fSign}${futPct}%</td>
+          <td class="${dCls} num">${dSign}${diff.toFixed(2)}%</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function sendDivNotification(a) {
+      const title = `⚡ Расхождение: ${a.stock.ticker}`;
+      const sSign = a.stock.change_pct >= 0 ? '+' : '';
+      const fSign = a.futPct >= 0 ? '+' : '';
+      const body = `Акция ${sSign}${a.stock.change_pct}% · Фьюч ${fSign}${a.futPct}% · Разница ${a.diff.toFixed(2)}%`;
+
+      if ('Notification' in window) {
+        if (Notification.permission === 'granted') {
+          new Notification(title, { body, icon: '' });
+        } else if (Notification.permission === 'default') {
+          Notification.requestPermission().then(p => {
+            if (p === 'granted') new Notification(title, { body });
+          });
+        }
+      }
+
+      // Дополнительно — мигаем строкой в таблице и пишем в message
+      const msg = document.getElementById('message');
+      if (msg) {
+        msg.className = 'msg error';
+        msg.textContent = `⚡ ${title}: ${body}`;
+        setTimeout(() => { if (msg.textContent.startsWith('⚡')) msg.textContent = ''; }, 8000);
+      }
+    }
+
+    function startDivergenceMonitor(auctionInfo) {
+      // Запускаем только во время аукциона фьючерсов
+      const isFutAuction = auctionInfo && auctionInfo.futures_auction;
+      if (isFutAuction) {
+        if (!_divTimer) {
+          checkDivergence();
+          _divTimer = setInterval(checkDivergence, 5000);
+        }
+      } else {
+        if (_divTimer) { clearInterval(_divTimer); _divTimer = null; }
+        // Скрываем панель вне аукциона
+        const panel = document.getElementById('divergencePanel');
+        if (panel) panel.style.display = 'none';
+      }
     }
 
     function updateLastUpdate() {
@@ -622,6 +927,12 @@
       allFutures.forEach(f => {
         namesMap[f.figi] = f.name || f.ticker;
         namesMap[f.instrument_uid] = f.name || f.ticker;
+      });
+      // Строим tickerMap: instrument_uid → ticker (для divergence monitor)
+      window._tickerMap = {};
+      allFutures.forEach(f => {
+        if (f.instrument_uid) window._tickerMap[f.instrument_uid] = f.ticker;
+        if (f.figi) window._tickerMap[f.figi] = f.ticker;
       });
       try { localStorage.setItem(STORAGE_NAMES, JSON.stringify(namesMap)); } catch (_) {}
       return allFutures;
@@ -854,10 +1165,14 @@
         currentRows = data.rows || [];
         currentRows.forEach(row => {
           row.name = namesMap[row.instrument_id] || row.instrument_id;
+          if (!row.ticker && window._tickerMap) {
+            row.ticker = window._tickerMap[row.instrument_id] || '';
+          }
         });
         renderTable(currentRows);
         updateAuctionBadge();
         updateLastUpdate();
+        startDivergenceMonitor(auctionInfo);
         
         // Показываем предупреждение о лимите
         if (data.limit_warning) {
@@ -920,6 +1235,8 @@
         // Сначала переключаем видимость панели (синхронно), потом подгружаем список
         panel.style.display = isVisible ? 'none' : 'block';
         if (panel.style.display === 'none') return;
+        // Рендерим список API ключей
+        renderApiKeys();
         // Показываем название профиля в настройках
         const profileNameEl = document.getElementById('profileNameInSettings');
         if (profileNameEl) profileNameEl.textContent = CURRENT_PROFILE;
@@ -1111,6 +1428,7 @@
 
     // Init: как раньше — ждём загрузку списка и данных, потом снимаем блокировку (к 7:00 при открытом рынке всё успеет)
     (async function init() {
+      startNotifyPolling();
       setLoading(true);
       try {
         await loadFutures();

@@ -57,6 +57,10 @@ _stats = {
 }
 _stats_lock = threading.Lock()
 
+# ========== Очередь браузерных уведомлений ==========
+_notify_queue = []   # [{"id": str, "msg": str, "ts": float}]
+_notify_lock = threading.Lock()
+
 
 def _record_request(endpoint, session_id=None):
     """Записать запрос в статистику."""
@@ -311,8 +315,22 @@ def _get_api_url():
     return API_URL_SANDBOX if use_sandbox else API_URL_PROD
 
 
-def _get_headers():
-    token = os.environ.get("TINKOFF_INVEST_TOKEN", "").strip()
+def _get_token_from_request():
+    """Получить токен из заголовка X-API-Tokens (список через запятую) или из env.
+    Если токенов несколько — выбирает следующий по кругу (round-robin)."""
+    header = request.headers.get("X-API-Tokens", "").strip()
+    if header:
+        tokens = [t.strip() for t in header.split(",") if t.strip()]
+        if tokens:
+            # Round-robin: выбираем токен по текущей секунде
+            idx = int(time.time()) % len(tokens)
+            return tokens[idx]
+    return os.environ.get("TINKOFF_INVEST_TOKEN", "").strip()
+
+
+def _get_headers(token=None):
+    if token is None:
+        token = os.environ.get("TINKOFF_INVEST_TOKEN", "").strip()
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -335,8 +353,9 @@ def index():
     Без параметра ?profile=... показываем заглушку, чтобы доступ был только по
     именным ссылкам вида /?profile=nikita.
     """
-    profile = request.args.get("profile", "").strip()
-    if not profile:
+    ALLOWED_PROFILES = {"damir", "ruslan", "kolya", "vanya", "nikita", "anton", "alex"}
+    profile = request.args.get("profile", "").strip().lower()
+    if not profile or profile not in ALLOWED_PROFILES:
         # Простая заглушка без виджета и без настроек
         return (
             """
@@ -399,7 +418,103 @@ def index():
 
 
 # Список акций (спот), которые нужно показывать
-SPOT_TICKERS = ["PLZL", "SBER", "LKOH", "GAZP", "NVTK", "VTBR", "GMKN"]
+SPOT_TICKERS = ["SBER", "GAZP", "LKOH", "NVTK", "GMKN", "VTBR", "PLZL",
+                "ROSN", "TATN", "YNDX", "MGNT", "AFLT", "ALRS", "MTSS",
+                "NLMK", "MAGN", "CHMF", "POLY", "PHOR", "IRAO"]
+
+# Маппинг: тикер акции → префикс тикера фьючерса на MOEX
+# Фьючи ищутся по вхождению префикса в тикер (SBER → SBERМ25, SBERH25 и т.д.)
+# ПРОВЕРЬ и поправь список под реальные тикеры в T-Invest!
+BLUE_CHIP_FUTURES_MAP = {
+    "SBER":  "SBRF",   # Сбербанк (SBRF-6.26, SBERF)
+    "GAZP":  "GAZRF",  # Газпром  (GAZRF, GAZR-6.26)
+    "LKOH":  "LKOH",   # ЛУКОЙЛ   (LKOH-6.26)
+    "NVTK":  "NVTK",   # Новатэк
+    "GMKN":  "GMKN",   # Норникель
+    "VTBR":  "VTBR",   # ВТБ
+    "PLZL":  "PLZL",   # Полюс Золото
+    "ROSN":  "ROSN",   # Роснефть
+    "TATN":  "TATN",   # Татнефть
+    "YNDX":  "YNDX",   # Яндекс
+    "MGNT":  "MGNT",   # Магнит
+    "AFLT":  "AFLT",   # Аэрофлот
+    "ALRS":  "ALRS",   # АЛРОСА
+    "MTSS":  "MTSS",   # МТС
+    "NLMK":  "NLMK",   # НЛМК
+    "MAGN":  "MAGN",   # ММК
+    "CHMF":  "CHMF",   # Северсталь
+    "POLY":  "POLY",   # Полиметалл
+    "PHOR":  "PHOR",   # ФосАгро
+    "IRAO":  "IRAO",   # Интер РАО
+}
+
+
+@app.route("/api/spot_prices")
+def api_spot_prices():
+    """Текущие цены и % изменение от дневного закрытия для акций голубых фишек.
+    Используется для мониторинга расхождения с фьючерсами во время аукциона.
+    """
+    token = _get_token_from_request()
+    if not token:
+        return jsonify({"error": "TINKOFF_INVEST_TOKEN not set"}), 503
+
+    base_url = _get_api_url()
+    headers = _get_headers(token)
+
+    # Берём кэшированный список инструментов (загружается через /api/futures)
+    instruments_cache = _cache_get("instruments_list")
+    if instruments_cache is None:
+        return jsonify({"error": "instruments not loaded, open /api/futures first"}), 503
+
+    # Фильтруем только акции из нашего списка
+    spot_instruments = [
+        i for i in instruments_cache
+        if i.get("instrument_type") == "shares"
+        and i.get("ticker", "").upper() in [t.upper() for t in SPOT_TICKERS]
+    ]
+
+    if not spot_instruments:
+        return jsonify({"stocks": [], "mapping": BLUE_CHIP_FUTURES_MAP})
+
+    # Батч-запрос последних цен сразу для всех акций
+    uids = [i.get("instrument_uid") or i.get("figi") for i in spot_instruments if i.get("instrument_uid") or i.get("figi")]
+    last_prices_map = {}
+    try:
+        url = f"{base_url}/tinkoff.public.invest.api.contract.v1.MarketDataService/GetLastPrices"
+        resp = requests.post(url, headers=headers, json={"instrumentId": uids}, timeout=15, verify=False)
+        resp.raise_for_status()
+        for lp in resp.json().get("lastPrices", []):
+            uid = lp.get("instrumentUid") or lp.get("figi", "")
+            price = _quotation_to_float(lp.get("price"))
+            if uid and price:
+                last_prices_map[uid] = price
+    except Exception as e:
+        logger.warning("GetLastPrices failed: %s", e)
+
+    result = []
+    for inst in spot_instruments:
+        ticker = inst.get("ticker", "")
+        uid = inst.get("instrument_uid") or inst.get("figi", "")
+        last_price = last_prices_map.get(uid)
+
+        # Дневное закрытие (кэшируется на 5 мин)
+        daily_close = _fetch_daily_close(uid, base_url, headers)
+
+        change_pct = None
+        if last_price and daily_close and daily_close != 0:
+            change_pct = round((last_price - daily_close) / daily_close * 100, 2)
+
+        result.append({
+            "ticker": ticker,
+            "name": inst.get("name", ticker),
+            "instrument_uid": uid,
+            "last_price": round(last_price, 4) if last_price else None,
+            "daily_close": round(daily_close, 4) if daily_close else None,
+            "change_pct": change_pct,
+            "futures_prefix": BLUE_CHIP_FUTURES_MAP.get(ticker.upper(), ticker),
+        })
+
+    return jsonify({"stocks": result, "mapping": BLUE_CHIP_FUTURES_MAP})
 
 
 @app.route("/api/stats")
@@ -428,7 +543,7 @@ def api_futures():
     """Список фьючерсов + избранных акций (спот) для настроек. Кэшируется на 5 минут."""
     session_id = request.args.get("session_id") or request.headers.get("X-Session-ID")
     _record_request("/api/futures", session_id)
-    token = os.environ.get("TINKOFF_INVEST_TOKEN", "").strip()
+    token = _get_token_from_request()
     if not token:
         logger.warning("TINKOFF_INVEST_TOKEN not set")
         return jsonify({"error": "TINKOFF_INVEST_TOKEN not set"}), 503
@@ -441,7 +556,7 @@ def api_futures():
         return jsonify({"futures": cached, "cached": True})
 
     base_url = _get_api_url()
-    headers = _get_headers()
+    headers = _get_headers(token)
     items = []
 
     # 1. Загружаем фьючерсы
@@ -686,7 +801,7 @@ def _fetch_candles_for_instrument(instrument_id, base_url, headers, from_ts, to_
 @app.route("/api/table")
 def api_table():
     """Данные для таблицы: по списку instrument_id — последняя 5-минутная свеча (close) + цена аукциона + отклонение + лоты."""
-    token = os.environ.get("TINKOFF_INVEST_TOKEN", "").strip()
+    token = _get_token_from_request()
     if not token:
         return jsonify({"error": "TINKOFF_INVEST_TOKEN not set"}), 503
 
@@ -696,7 +811,7 @@ def api_table():
     instrument_ids = [x.strip() for x in ids_param.split(",") if x.strip()]
 
     base_url = _get_api_url()
-    headers = _get_headers()
+    headers = _get_headers(token)
 
     rows = []
     cached_count = 0
@@ -1088,25 +1203,25 @@ def api_orderbook():
     """
     session_id = request.args.get("session_id") or request.headers.get("X-Session-ID")
     _record_request("/api/orderbook", session_id)
-    token = os.environ.get("TINKOFF_INVEST_TOKEN", "").strip()
+    token = _get_token_from_request()
     if not token:
         return jsonify({"error": "TINKOFF_INVEST_TOKEN not set"}), 503
 
     ids_param = request.args.get("ids", "")
     if not ids_param:
         return jsonify({"rows": [], "auction": _is_auction_time()})
-    
+
     instrument_ids = [x.strip() for x in ids_param.split(",") if x.strip()]
-    
+
     # Отмечаем инструменты как активные (для фонового обновления)
     for instrument_id in instrument_ids:
         _mark_instrument_active(instrument_id)
-    
+
     # Запускаем фоновый поток, если ещё не запущен
     _start_background_thread()
-    
+
     base_url = _get_api_url()
-    headers = _get_headers()
+    headers = _get_headers(token)
     
     rows = []
     cached_count = 0
@@ -1141,6 +1256,31 @@ def api_orderbook():
         "cache_stats": cache_stats,
         "limit_warning": limit_warning,
     })
+
+
+@app.route("/api/notify/push", methods=["POST", "GET"])
+def notify_push():
+    """Добавить уведомление в очередь. Параметр msg — текст уведомления."""
+    msg = (request.args.get("msg") or (request.json or {}).get("msg", "")).strip()
+    if not msg:
+        return jsonify({"error": "msg required"}), 400
+    with _notify_lock:
+        _notify_queue.append({
+            "id": str(time.time()),
+            "msg": msg,
+            "ts": time.time(),
+        })
+    logger.info("notify_push: %s", msg)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/notify/poll")
+def notify_poll():
+    """Фронтенд забирает уведомления и удаляет их из очереди."""
+    with _notify_lock:
+        items = list(_notify_queue)
+        _notify_queue.clear()
+    return jsonify({"notifications": items})
 
 
 def main():

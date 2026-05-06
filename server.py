@@ -908,28 +908,35 @@ def _is_auction_time(instrument_type=None):
     }
 
 
-def _calculate_auction_price(bids, asks):
-    """Рассчитать цену сведения аукциона через кумулятивные объёмы.
-    
+def _calculate_auction_price(bids, asks, reference_price=None):
+    """Рассчитать цену сведения аукциона по правилам биржи (MOEX-style).
+
     Алгоритм:
-    1. Строим кумулятивный bid (сверху вниз по цене): сколько готовы купить по цене X или ВЫШЕ
-    2. Строим кумулятивный ask (снизу вверх по цене): сколько готовы продать по цене X или НИЖЕ
-    3. Цена сведения — цена, где кумулятивные объёмы пересекаются
-    4. Лоты сделки = min(cumulative_bid, cumulative_ask) в точке пересечения
-    5. Дисбаланс = |cumulative_bid - cumulative_ask| — лоты, которые НЕ исполнятся
-    
+      1. Кумулятивный bid (сверху вниз) и ask (снизу вверх)
+      2. На каждой цене executed = min(cum_bid, cum_ask)
+      3. Равновесный диапазон — все цены, где executed == max(executed)
+      4. В диапазоне отфильтровать по min |imbalance|
+      5. Выбор цены:
+         - дисбаланс везде в bid (cum_bid > cum_ask) → ВЕРХНЯЯ цена диапазона
+         - дисбаланс везде в ask (cum_ask > cum_bid) → НИЖНЯЯ цена диапазона
+         - смешанный знак или 0 → ближайшая к reference_price
+           (или середина диапазона, если ref нет)
+
+    Args:
+        bids, asks: списки заявок из API T-Invest
+        reference_price: цена-ориентир для случая нулевого дисбаланса
+                        (обычно last_price или предыдущий close)
+
     Returns:
         tuple: (auction_price, executed_lots, imbalance, imbalance_direction)
         - auction_price: цена сведения
         - executed_lots: количество лотов, которые исполнятся
-        - imbalance: количество лотов, которые НЕ исполнятся
-        - imbalance_direction: 'bid' если покупатели преобладают, 'ask' если продавцы
+        - imbalance: лоты, которые НЕ исполнятся (модуль)
+        - imbalance_direction: 'bid' / 'ask' / None
     """
-    # Если стакан полностью пустой
+    # ===== Граничные случаи =====
     if not bids and not asks:
         return None, 0, 0, None
-    # Если есть заявки только с одной стороны, используем лучшую цену этой стороны
-    # как индикативную "цену аукциона" (лоты исполнения = 0, весь объём считается дисбалансом)
     if bids and not asks:
         best_bid_price = _quotation_to_float(bids[0].get("price"))
         total_bid_lots = sum(int(b.get("quantity", 0)) for b in bids)
@@ -948,82 +955,95 @@ def _calculate_auction_price(bids, asks):
             total_ask_lots,
             "ask",
         )
-    
-    # Парсим и сортируем заявки. Цены округляем до 4 знаков, чтобы один уровень стакана
-    # не разбивался из-за float (иначе executed_lots занижался или был 0 у фьючерсов).
+
+    # ===== Парсинг и группировка по уровням =====
     _round = lambda x: round(x, 4)
-    parsed_bids = sorted(
-        [(_round(_quotation_to_float(b.get("price"))), int(b.get("quantity", 0))) for b in bids],
-        key=lambda x: x[0],
-        reverse=True
-    )
-    parsed_asks = sorted(
-        [(_round(_quotation_to_float(a.get("price"))), int(a.get("quantity", 0))) for a in asks],
-        key=lambda x: x[0]
-    )
-    
-    # Собираем все уникальные цены для анализа (уже округлённые)
-    all_prices = sorted(set([p for p, _ in parsed_bids] + [p for p, _ in parsed_asks]))
-    
+    bid_by_price = {}
+    for b in bids:
+        p = _round(_quotation_to_float(b.get("price")))
+        bid_by_price[p] = bid_by_price.get(p, 0) + int(b.get("quantity", 0))
+    ask_by_price = {}
+    for a in asks:
+        p = _round(_quotation_to_float(a.get("price")))
+        ask_by_price[p] = ask_by_price.get(p, 0) + int(a.get("quantity", 0))
+
+    all_prices = sorted(set(list(bid_by_price.keys()) + list(ask_by_price.keys())))
     if not all_prices:
         return None, 0, 0, None
-    
-    # Строим кумулятивные объёмы для каждой цены
-    # cumulative_bid[price] = сколько лотов готовы купить по цене >= price
-    # cumulative_ask[price] = сколько лотов готовы продать по цене <= price
-    
-    # Словари объёмов по цене — O(n), без float-сравнений в цикле
-    bid_by_price = {}
-    for bid_price, bid_qty in parsed_bids:
-        bid_by_price[bid_price] = bid_by_price.get(bid_price, 0) + bid_qty
-    ask_by_price = {}
-    for ask_price, ask_qty in parsed_asks:
-        ask_by_price[ask_price] = ask_by_price.get(ask_price, 0) + ask_qty
 
-    # Кумулятивный bid: идём от высокой цены к низкой, накапливаем
+    # ===== Кумулятивные объёмы =====
     cumulative_bid = {}
-    running_bid = 0
+    running = 0
     for price in reversed(all_prices):
-        running_bid += bid_by_price.get(price, 0)
-        cumulative_bid[price] = running_bid
+        running += bid_by_price.get(price, 0)
+        cumulative_bid[price] = running
 
-    # Кумулятивный ask: идём от низкой цены к высокой, накапливаем
     cumulative_ask = {}
-    running_ask = 0
+    running = 0
     for price in all_prices:
-        running_ask += ask_by_price.get(price, 0)
-        cumulative_ask[price] = running_ask
-    
-    # Ищем точку пересечения: цену, где cumulative_bid и cumulative_ask ближе всего
-    # Цена сведения — это цена, где min(cum_bid, cum_ask) максимален
-    best_price = None
-    best_executed = 0
-    best_imbalance = 0
-    best_direction = None
-    
+        running += ask_by_price.get(price, 0)
+        cumulative_ask[price] = running
+
+    # ===== На каждой цене считаем executed и raw imbalance =====
+    levels = []  # (price, cum_bid, cum_ask, executed, imbalance_signed)
     for price in all_prices:
-        cum_bid = cumulative_bid.get(price, 0)
-        cum_ask = cumulative_ask.get(price, 0)
-        
-        # Количество исполненных лотов — минимум из двух
-        executed = min(cum_bid, cum_ask)
-        
-        if executed > best_executed:
-            best_executed = executed
-            best_price = price
-            best_imbalance = abs(cum_bid - cum_ask)
-            best_direction = 'bid' if cum_bid > cum_ask else ('ask' if cum_ask > cum_bid else None)
-    
-    # Если не нашли пересечение — нет аукционной цены
-    if best_price is None:
+        cb = cumulative_bid.get(price, 0)
+        ca = cumulative_ask.get(price, 0)
+        executed = min(cb, ca)
+        imb = cb - ca   # знак: + → bid, − → ask, 0 → баланс
+        levels.append((price, cb, ca, executed, imb))
+
+    max_executed = max(l[3] for l in levels)
+    if max_executed == 0:
+        # Стаканы не пересекаются вообще
         return None, 0, 0, None
 
-    # Округляем цену до 2 знаков (копейки)
+    # Шаг 1: равновесный диапазон
+    equilibrium = [l for l in levels if l[3] == max_executed]
+
+    # Шаг 2: минимальный |imbalance| в диапазоне
+    min_abs_imb = min(abs(l[4]) for l in equilibrium)
+    candidates = [l for l in equilibrium if abs(l[4]) == min_abs_imb]
+
+    # Шаг 3: выбор цены по направлению дисбаланса
+    signs = set()
+    for l in candidates:
+        if l[4] > 0:
+            signs.add(1)
+        elif l[4] < 0:
+            signs.add(-1)
+        else:
+            signs.add(0)
+
+    if signs == {1}:
+        # Везде bid преобладает — берём максимальную цену
+        chosen = max(candidates, key=lambda l: l[0])
+    elif signs == {-1}:
+        # Везде ask преобладает — берём минимальную цену
+        chosen = min(candidates, key=lambda l: l[0])
+    else:
+        # Смешанный знак или нулевой дисбаланс → используем reference_price
+        if reference_price and reference_price > 0:
+            chosen = min(candidates, key=lambda l: abs(l[0] - reference_price))
+        else:
+            # Без референса — середина диапазона (берём центральный кандидат)
+            sorted_c = sorted(candidates, key=lambda l: l[0])
+            chosen = sorted_c[len(sorted_c) // 2]
+
+    best_price, _cb, _ca, best_executed, raw_imb = chosen
+    best_imbalance = abs(raw_imb)
+    if raw_imb > 0:
+        best_direction = 'bid'
+    elif raw_imb < 0:
+        best_direction = 'ask'
+    else:
+        best_direction = None
+
     return (
-        round(best_price, 2) if best_price else None,
+        round(best_price, 2),
         best_executed,
         best_imbalance,
-        best_direction
+        best_direction,
     )
 
 
@@ -1052,9 +1072,10 @@ def _fetch_orderbook_direct(instrument_id, base_url, headers, depth=50):
         total_bid_lots = sum(int(b.get("quantity", 0)) for b in bids)
         total_ask_lots = sum(int(a.get("quantity", 0)) for a in asks)
         
-        auction_price, executed_lots, imbalance, imbalance_direction = _calculate_auction_price(bids, asks)
         last_price = _quotation_to_float(data.get("lastPrice"))
         close_price = _quotation_to_float(data.get("closePrice"))
+        ref_for_auction = last_price or close_price or None
+        auction_price, executed_lots, imbalance, imbalance_direction = _calculate_auction_price(bids, asks, ref_for_auction)
         # Дневное закрытие: из дневных свечей API, иначе closePrice стакана
         daily_close_price = _fetch_daily_close(instrument_id, base_url, headers)
         if daily_close_price is None:
@@ -1142,9 +1163,10 @@ def _fetch_orderbook(instrument_id, base_url, headers, depth=50):
         total_ask_lots = sum(int(a.get("quantity", 0)) for a in asks)
         
         # Рассчитываем цену аукциона через кумулятивные объёмы
-        auction_price, executed_lots, imbalance, imbalance_direction = _calculate_auction_price(bids, asks)
         last_price = _quotation_to_float(data.get("lastPrice"))
         close_price = _quotation_to_float(data.get("closePrice"))
+        ref_for_auction = last_price or close_price or None
+        auction_price, executed_lots, imbalance, imbalance_direction = _calculate_auction_price(bids, asks, ref_for_auction)
         daily_close_price = _fetch_daily_close(instrument_id, base_url, headers)
         if daily_close_price is None:
             daily_close_price = close_price
